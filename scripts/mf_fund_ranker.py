@@ -31,10 +31,10 @@ INPUT_FILE  = "dashboard_data.xlsx"
 OUTPUT_FILE = "mf_ranked_screener.xlsx"
 
 WEIGHTS = {
-    "return_1y":  0.40,
-    "return_3y":  0.40,
-    "aum":        0.10,
-    "expense":    0.10,   # inverted: lower expense → higher score
+    "return_1y":  0.45,
+    "return_3y":  0.45,
+    "aum":        0.05,   # not in dataset — will gracefully skip
+    "expense":    0.05,   # not in dataset — will gracefully skip
 }
 
 # ── COLUMN AUTO-DETECTION ───────────────────────────────────────────────────
@@ -44,22 +44,23 @@ COLUMN_ALIASES = {
         "fund", "scheme"
     ],
     "category": [
+        "cat_level_3", "cat_level_2", "cat_level_1",
         "category", "scheme_category", "scheme category", "cat",
         "fund_category", "fund category", "sub_category", "sub category",
-        "category_name", "cat_level_3", "cat_level_2", "sub_type"
+        "category_name", "sub_type"
     ],
     "amc": [
         "amc", "amc_name", "amc name", "fund_house", "fund house",
         "amcname", "asset_management_company", "house"
     ],
     "return_1y": [
-        "return_1y", "1y_return", "1yr_return", "returns_1y", "1y return",
-        "1 year return", "1yr", "ret_1y", "cagr_1y", "1y_cagr",
+        "return_365d", "return_1y", "1y_return", "1yr_return", "returns_1y",
+        "1y return", "1 year return", "1yr", "ret_1y", "cagr_1y", "1y_cagr",
         "trailing_1y", "1year_return", "ann_return_1y"
     ],
     "return_3y": [
-        "return_3y", "3y_return", "3yr_return", "returns_3y", "3y return",
-        "3 year return", "3yr", "ret_3y", "cagr_3y", "3y_cagr",
+        "return_1095d", "return_3y", "3y_return", "3yr_return", "returns_3y",
+        "3y return", "3 year return", "3yr", "ret_3y", "cagr_3y", "3y_cagr",
         "trailing_3y", "3year_return", "ann_return_3y"
     ],
     "aum": [
@@ -166,16 +167,36 @@ def score_funds(df, mapping):
     else:
         df["_category_clean"] = df[cat_col].astype(str).str.strip().str.title()
 
+    # Determine which columns actually have data
+    has_r1  = mapping["return_1y"]  and df["_r1"].notna().any()
+    has_r3  = mapping["return_3y"]  and df["_r3"].notna().any()
+    has_aum = mapping["aum"]        and df["_aum"].notna().any()
+    has_exp = mapping["expense"]    and df["_exp"].notna().any()
+
+    # Redistribute weights if some columns are missing
+    active = {k: v for k, v in [
+        ("return_1y", has_r1), ("return_3y", has_r3),
+        ("aum", has_aum), ("expense", has_exp)
+    ] if v}
+    raw_total = sum(WEIGHTS[k] for k in active)
+    adj_weights = {k: WEIGHTS[k] / raw_total for k in active}
+    print(f"\n   Active scoring columns: {list(active.keys())}")
+    print(f"   Adjusted weights: { {k: f'{v:.0%}' for k, v in adj_weights.items()} }")
+
     # Score per category
     score_parts = []
     for cat, grp in df.groupby("_category_clean"):
         g = grp.copy()
-        s1  = percentile_score(g["_r1"].fillna(g["_r1"].median()))  * WEIGHTS["return_1y"]
-        s3  = percentile_score(g["_r3"].fillna(g["_r3"].median()))  * WEIGHTS["return_3y"]
-        sa  = percentile_score(g["_aum"].fillna(g["_aum"].median()))* WEIGHTS["aum"]
-        # Expense: lower is better → invert
-        se  = percentile_score(-g["_exp"].fillna(g["_exp"].median()))* WEIGHTS["expense"]
-        g["_composite_score"] = (s1 + s3 + sa + se).round(1)
+        score = pd.Series(0.0, index=g.index)
+        if has_r1:
+            score += percentile_score(g["_r1"].fillna(g["_r1"].median())) * adj_weights["return_1y"]
+        if has_r3:
+            score += percentile_score(g["_r3"].fillna(g["_r3"].median())) * adj_weights["return_3y"]
+        if has_aum:
+            score += percentile_score(g["_aum"].fillna(g["_aum"].median())) * adj_weights["aum"]
+        if has_exp:
+            score += percentile_score(-g["_exp"].fillna(g["_exp"].median())) * adj_weights["expense"]
+        g["_composite_score"] = score.round(1)
         g["_rank"] = g["_composite_score"].rank(method='min', ascending=False).astype(int)
         score_parts.append(g)
 
@@ -239,7 +260,7 @@ def build_excel(df, mapping, output_path):
 
         # Sub-header
         ws.merge_cells("A2:K2")
-        ws["A2"] = f"Scoring: 1Y Returns 40%  |  3Y CAGR 40%  |  AUM 10%  |  Expense Ratio 10%   |   Total funds: {len(cat_df)}"
+        ws["A2"] = f"Scoring: 1Y Returns (return_365d) 45%  |  3Y CAGR (return_1095d) 45%  |  AUM+Expense 10% (if available)   |   Total funds: {len(cat_df)}"
         ws["A2"].font = Font(name="Arial", italic=True, size=8, color="555555")
         ws["A2"].fill = fill("F0F4F8")
         ws["A2"].alignment = Alignment(horizontal="left", indent=1)
@@ -323,7 +344,7 @@ def build_excel(df, mapping, output_path):
     ws_sum.row_dimensions[1].height = 30
 
     ws_sum.merge_cells("A2:G2")
-    ws_sum["A2"] = "Scoring: 1Y Returns (40%) + 3Y CAGR (40%) + AUM (10%) + Expense Ratio inverse (10%)"
+    ws_sum["A2"] = "Scoring: 1Y Returns (45%) + 3Y CAGR (45%) + AUM/Expense if available (10%) | Category grouping: cat_level_3"
     ws_sum["A2"].font = Font(name="Arial", italic=True, size=8, color="555555")
     ws_sum["A2"].fill = fill("F5F5F5")
     ws_sum["A2"].alignment = Alignment(horizontal="center")
